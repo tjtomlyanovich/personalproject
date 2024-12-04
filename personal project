@@ -1,0 +1,207 @@
+import dash
+from dash import dcc, html, Input, Output, State
+import yfinance as yf
+import pandas as pd
+import plotly.graph_objs as go
+
+# Initialize the Dash app
+app = dash.Dash(__name__)
+app.title = "Foreign Listing Analysis"
+
+# Static Conversion Rates
+GBP_TO_USD = 1.2657326
+CAD_TO_USD = 0.71206658
+
+# Define the layout
+app.layout = html.Div([
+    html.H1("Foreign Listing Analysis", style={"textAlign": "center"}),
+
+    html.P("Note: All prices are shown in USD.", style={"textAlign": "center", "fontSize": "14px", "color": "gray"}),
+
+    html.Div(id="technical-info-output", style={"textAlign": "center", "marginTop": "20px", "marginBottom": "20px"}),
+
+    html.Div([
+        html.Label("Enter Stock Ticker:"),
+        dcc.Input(id="ticker-input", type="text", placeholder="e.g., AAPL", style={"width": "50%"}),
+        html.Button("Analyze", id="analyze-button", n_clicks=0),
+    ], style={"textAlign": "center", "marginBottom": "20px"}),
+
+    html.Div(id="status-output", style={"textAlign": "center", "marginTop": "20px"}),
+
+    dcc.Graph(id="closing-price-graph"),
+    dcc.Graph(id="average-volume-graph")
+])
+
+
+# Helper functions
+def convert_prices_to_usd(data, info, conversion_rate, is_pence=False):
+    """
+    Convert all prices and technical stats to USD using static conversion rates.
+    """
+    # Convert prices
+    price_columns = ['Open', 'High', 'Low', 'Close', 'Adj Close']
+    for col in price_columns:
+        if col in data.columns:
+            if is_pence:  # Convert from pence to pounds before applying USD conversion
+                data[col] = (data[col] / 100) * conversion_rate
+            else:
+                data[col] = data[col] * conversion_rate
+
+    # Convert technical stats
+    price_keys = [
+        'fiftyTwoWeekHigh', 'fiftyTwoWeekLow', 'dividendRate',
+        'forwardDividendRate', 'marketCap', 'earningsPerShare'
+    ]
+    for key in price_keys:
+        if key in info and info[key] is not None:
+            if is_pence:
+                info[key] = (info[key] / 100) * conversion_rate
+            else:
+                info[key] *= conversion_rate
+
+    return data, info
+
+
+def fetch_stock_data(ticker, exchange_suffix, conversion_rate, is_pence=False):
+    """
+    Fetch stock data and convert to USD before returning.
+    """
+    full_ticker = ticker + exchange_suffix
+    print(f"Fetching data for ticker: {full_ticker}")
+
+    try:
+        stock = yf.Ticker(full_ticker)
+        stock_info = stock.history(period="1mo", interval="1d")
+
+        if stock_info.empty:
+            print(f"No data found for {full_ticker}.")
+            return None, None
+
+        print(f"Data fetched for {full_ticker}: {stock_info.head()}")
+        stock_info, stock_meta = convert_prices_to_usd(stock_info, stock.info, conversion_rate, is_pence)
+        return stock_info, stock_meta
+
+    except Exception as e:
+        print(f"Error fetching or processing data for {full_ticker}: {e}")
+        return None, None
+
+
+def determine_listing_status(ticker):
+    """
+    Check if the stock is listed on US, London, or Toronto exchanges and convert prices to USD.
+    """
+    exchanges = {
+        "US": ("", 1.0, False),  # US prices are already in USD
+        "London": (".L", GBP_TO_USD, True),  # London uses GBP in pence
+        "Toronto": (".TO", CAD_TO_USD, False)  # Toronto uses CAD
+    }
+    listing_status = {}
+    data_sources = {}
+
+    for exchange, (suffix, conversion_rate, is_pence) in exchanges.items():
+        data, info = fetch_stock_data(ticker, suffix, conversion_rate, is_pence)
+        if data is not None:
+            listing_status[exchange] = "Yes"
+            data_sources[exchange] = (data, info)
+        else:
+            listing_status[exchange] = "No"
+    return listing_status, data_sources
+
+
+def create_closing_price_graph(data_sources):
+    """
+    Generate a Plotly graph for closing prices.
+    """
+    fig = go.Figure()
+    for exchange, (data, _) in data_sources.items():
+        price_column = 'Adj Close' if 'Adj Close' in data.columns else 'Close'
+        fig.add_trace(go.Scatter(x=data.index, y=data[price_column], mode='lines', name=f"{exchange} Exchange"))
+    fig.update_layout(title="Closing Prices (USD)", xaxis_title="Date", yaxis_title="Price (USD)")
+    return fig
+
+
+def create_average_volume_graph(data_sources):
+    """
+    Generate a Plotly bar chart for average volumes.
+    """
+    avg_volumes = {exchange: data['Volume'].mean() for exchange, (data, _) in data_sources.items()}
+    fig = go.Figure([go.Bar(x=list(avg_volumes.keys()), y=list(avg_volumes.values()))])
+    fig.update_layout(title="Average Volumes", xaxis_title="Exchange", yaxis_title="Volume")
+    return fig
+
+
+def generate_technical_info(data_sources):
+    """
+    Generate technical information as HTML Divs for each exchange.
+    """
+    info_list = []
+
+    for exchange, (_, info) in data_sources.items():
+        try:
+            name = info.get("shortName", "N/A")
+            high_52_week = info.get("fiftyTwoWeekHigh", "N/A")
+            low_52_week = info.get("fiftyTwoWeekLow", "N/A")
+            pe_ratio = info.get("trailingPE", "N/A")
+            dividend_yield = info.get("dividendYield", "N/A")
+            dividend_yield = f"{dividend_yield * 100:.2f}%" if dividend_yield != "N/A" else "N/A"
+            market_cap = info.get("marketCap", "N/A")
+            beta = info.get("beta", "N/A")
+            earnings_date = info.get("earningsDate", ["N/A"])[0] if info.get("earningsDate") else "N/A"
+            forward_dividend = info.get("dividendRate", "N/A")
+            earnings_per_share = info.get("earningsPerShare", "N/A")
+
+            info_list.append(
+                html.Div([
+                    html.H4(f"{exchange} Exchange"),
+                    html.P(f"Company Name: {name}"),
+                    html.P(f"Market Cap (USD): ${market_cap:,.2f}" if market_cap != "N/A" else "Market Cap: N/A"),
+                    html.P(f"52-Week High (USD): ${high_52_week:.2f}" if high_52_week != "N/A" else "52-Week High: N/A"),
+                    html.P(f"52-Week Low (USD): ${low_52_week:.2f}" if low_52_week != "N/A" else "52-Week Low: N/A"),
+                    html.P(f"P/E Ratio: {pe_ratio}"),
+                    html.P(f"Earnings Per Share (USD): ${earnings_per_share:.2f}" if earnings_per_share != "N/A" else "Earnings Per Share: N/A"),
+                    html.P(f"Beta: {beta}"),
+                    html.P(f"Earnings Date: {earnings_date}"),
+                    html.P(f"Forward Dividend Rate (USD): ${forward_dividend:.2f}" if forward_dividend != "N/A" else "Forward Dividend Rate: N/A"),
+                    html.P(f"Dividend Yield: {dividend_yield}")
+                ])
+            )
+        except Exception as e:
+            print(f"Error generating technical info for {exchange}: {e}")
+            info_list.append(
+                html.Div([
+                    html.H4(f"{exchange} Exchange"),
+                    html.P("Error retrieving technical information.")
+                ])
+            )
+    return info_list
+
+
+@app.callback(
+    [Output("status-output", "children"),
+     Output("closing-price-graph", "figure"),
+     Output("average-volume-graph", "figure"),
+     Output("technical-info-output", "children")],
+    [Input("analyze-button", "n_clicks")],
+    [State("ticker-input", "value")]
+)
+def analyze_stock(n_clicks, ticker):
+    if not ticker:
+        return "Please enter a stock ticker.", go.Figure(), go.Figure(), []
+
+    listing_status, data_sources = determine_listing_status(ticker)
+
+    if not data_sources:
+        return f"No data found for '{ticker}'.", go.Figure(), go.Figure(), []
+
+    closing_price_graph = create_closing_price_graph(data_sources)
+    avg_volume_graph = create_average_volume_graph(data_sources)
+    technical_info = generate_technical_info(data_sources)
+
+    status_lines = [f"Listed on {exchange} Stock Exchange: {status}" for exchange, status in listing_status.items()]
+    status_output = html.Div([html.P(line) for line in status_lines])
+
+    return status_output, closing_price_graph, avg_volume_graph, technical_info
+
+
+if __name__ == "__main__":
+    app.run_server(debug=True, use_reloader=False)
