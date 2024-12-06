@@ -2,6 +2,7 @@ import dash
 from dash import dcc, html, Input, Output, State
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objs as go
 
 # Initialize the Dash app
@@ -29,25 +30,24 @@ app.layout = html.Div([
     html.Div(id="status-output", style={"textAlign": "center", "marginTop": "20px"}),
 
     dcc.Graph(id="closing-price-graph"),
-    dcc.Graph(id="average-volume-graph")
+    dcc.Graph(id="average-volume-graph"),
+    dcc.Graph(id="price-difference-graph"),
+    dcc.Graph(id="monthly-std-dev-graph")
 ])
-
 
 # Helper functions
 def convert_prices_to_usd(data, info, conversion_rate, is_pence=False):
     """
     Convert all prices and technical stats to USD using static conversion rates.
     """
-    # Convert prices
     price_columns = ['Open', 'High', 'Low', 'Close', 'Adj Close']
     for col in price_columns:
         if col in data.columns:
-            if is_pence:  # Convert from pence to pounds before applying USD conversion
+            if is_pence:
                 data[col] = (data[col] / 100) * conversion_rate
             else:
                 data[col] = data[col] * conversion_rate
 
-    # Convert technical stats
     price_keys = [
         'fiftyTwoWeekHigh', 'fiftyTwoWeekLow', 'dividendRate',
         'forwardDividendRate', 'marketCap', 'earningsPerShare'
@@ -67,22 +67,15 @@ def fetch_stock_data(ticker, exchange_suffix, conversion_rate, is_pence=False):
     Fetch stock data and convert to USD before returning.
     """
     full_ticker = ticker + exchange_suffix
-    print(f"Fetching data for ticker: {full_ticker}")
-
     try:
         stock = yf.Ticker(full_ticker)
         stock_info = stock.history(period="1mo", interval="1d")
-
         if stock_info.empty:
-            print(f"No data found for {full_ticker}.")
             return None, None
-
-        print(f"Data fetched for {full_ticker}: {stock_info.head()}")
         stock_info, stock_meta = convert_prices_to_usd(stock_info, stock.info, conversion_rate, is_pence)
         return stock_info, stock_meta
-
     except Exception as e:
-        print(f"Error fetching or processing data for {full_ticker}: {e}")
+        print(f"Error fetching data for {full_ticker}: {e}")
         return None, None
 
 
@@ -91,13 +84,12 @@ def determine_listing_status(ticker):
     Check if the stock is listed on US, London, or Toronto exchanges and convert prices to USD.
     """
     exchanges = {
-        "US": ("", 1.0, False),  # US prices are already in USD
-        "London": (".L", GBP_TO_USD, True),  # London uses GBP in pence
-        "Toronto": (".TO", CAD_TO_USD, False)  # Toronto uses CAD
+        "US": ("", 1.0, False),
+        "London": (".L", GBP_TO_USD, True),
+        "Toronto": (".TO", CAD_TO_USD, False)
     }
     listing_status = {}
     data_sources = {}
-
     for exchange, (suffix, conversion_rate, is_pence) in exchanges.items():
         data, info = fetch_stock_data(ticker, suffix, conversion_rate, is_pence)
         if data is not None:
@@ -135,7 +127,6 @@ def generate_technical_info(data_sources):
     Generate technical information as HTML Divs for each exchange.
     """
     info_list = []
-
     for exchange, (_, info) in data_sources.items():
         try:
             name = info.get("shortName", "N/A")
@@ -146,7 +137,6 @@ def generate_technical_info(data_sources):
             dividend_yield = f"{dividend_yield * 100:.2f}%" if dividend_yield != "N/A" else "N/A"
             market_cap = info.get("marketCap", "N/A")
             beta = info.get("beta", "N/A")
-            earnings_date = info.get("earningsDate", ["N/A"])[0] if info.get("earningsDate") else "N/A"
             forward_dividend = info.get("dividendRate", "N/A")
             earnings_per_share = info.get("earningsPerShare", "N/A")
 
@@ -160,7 +150,6 @@ def generate_technical_info(data_sources):
                     html.P(f"P/E Ratio: {pe_ratio}"),
                     html.P(f"Earnings Per Share (USD): ${earnings_per_share:.2f}" if earnings_per_share != "N/A" else "Earnings Per Share: N/A"),
                     html.P(f"Beta: {beta}"),
-                    html.P(f"Earnings Date: {earnings_date}"),
                     html.P(f"Forward Dividend Rate (USD): ${forward_dividend:.2f}" if forward_dividend != "N/A" else "Forward Dividend Rate: N/A"),
                     html.P(f"Dividend Yield: {dividend_yield}")
                 ])
@@ -176,31 +165,109 @@ def generate_technical_info(data_sources):
     return info_list
 
 
+def create_price_difference_graph(data_sources):
+    """
+    Create a graph that shows the difference in daily returns compared to a baseline exchange.
+    We will:
+    1. Compute daily returns for each exchange.
+    2. Pick the US exchange as a baseline if available, otherwise use the first listed exchange.
+    3. Plot the difference in returns for all other exchanges relative to the baseline.
+    """
+    if not data_sources:
+        return go.Figure()
+
+    # Determine baseline
+    if "US" in data_sources:
+        baseline_exchange = "US"
+    else:
+        # Just pick the first listed exchange if US isn't available
+        baseline_exchange = list(data_sources.keys())[0]
+
+    baseline_data = data_sources[baseline_exchange][0]
+    price_column = 'Adj Close' if 'Adj Close' in baseline_data.columns else 'Close'
+    baseline_returns = baseline_data[price_column].pct_change()
+
+    fig = go.Figure()
+    fig.update_layout(title="Daily Returns Difference from Baseline", xaxis_title="Date", yaxis_title="Return Difference")
+
+    # Plot other exchanges' difference from baseline
+    for exchange, (data, _) in data_sources.items():
+        if exchange == baseline_exchange:
+            continue
+        ex_price_col = 'Adj Close' if 'Adj Close' in data.columns else 'Close'
+        ex_returns = data[ex_price_col].pct_change()
+        return_diff = ex_returns - baseline_returns
+        fig.add_trace(go.Scatter(x=data.index, y=return_diff, mode='lines', name=f"{exchange} vs {baseline_exchange}"))
+
+    return fig
+
+
+def create_monthly_std_dev_graph(data_sources):
+    """
+    Create a graph showing the monthly standard deviation of returns for each exchange.
+    Steps:
+    1. Compute daily returns for each exchange.
+    2. Resample returns on a monthly basis and compute standard deviation.
+    3. Plot a bar chart where each bar represents the monthly standard deviation of returns for an exchange.
+    """
+    if not data_sources:
+        return go.Figure()
+
+    monthly_std = {}
+    for exchange, (data, _) in data_sources.items():
+        price_column = 'Adj Close' if 'Adj Close' in data.columns else 'Close'
+        daily_returns = data[price_column].pct_change()
+        # Compute monthly standard deviation
+        monthly_returns = daily_returns.resample('M').std()  # std of daily returns in each month
+        # Take the average of the monthly standard deviations over the period for simplicity
+        # Alternatively, we could show all months side-by-side, but that might be too detailed.
+        avg_monthly_std = monthly_returns.mean() if not monthly_returns.empty else np.nan
+        monthly_std[exchange] = avg_monthly_std
+
+    fig = go.Figure([go.Bar(x=list(monthly_std.keys()), y=list(monthly_std.values()))])
+    fig.update_layout(title="Average Monthly Standard Deviation of Returns",
+                      xaxis_title="Exchange",
+                      yaxis_title="Std Dev of Monthly Returns")
+
+    return fig
+
+
 @app.callback(
-    [Output("status-output", "children"),
-     Output("closing-price-graph", "figure"),
-     Output("average-volume-graph", "figure"),
-     Output("technical-info-output", "children")],
+    [
+        Output("status-output", "children"),
+        Output("closing-price-graph", "figure"),
+        Output("average-volume-graph", "figure"),
+        Output("technical-info-output", "children"),
+        Output("price-difference-graph", "figure"),
+        Output("monthly-std-dev-graph", "figure")
+    ],
     [Input("analyze-button", "n_clicks")],
     [State("ticker-input", "value")]
 )
 def analyze_stock(n_clicks, ticker):
     if not ticker:
-        return "Please enter a stock ticker.", go.Figure(), go.Figure(), []
+        # Return empty figures for all and a message
+        return ("Please enter a stock ticker.", go.Figure(), go.Figure(), [], go.Figure(), go.Figure())
 
     listing_status, data_sources = determine_listing_status(ticker)
 
     if not data_sources:
-        return f"No data found for '{ticker}'.", go.Figure(), go.Figure(), []
+        # If no data found for the given ticker, return placeholders
+        return (f"No data found for '{ticker}'.", go.Figure(), go.Figure(), [], go.Figure(), go.Figure())
 
+    # Generate existing figures and info
     closing_price_graph = create_closing_price_graph(data_sources)
     avg_volume_graph = create_average_volume_graph(data_sources)
     technical_info = generate_technical_info(data_sources)
 
+    # New figures
+    price_difference_graph = create_price_difference_graph(data_sources)
+    monthly_std_dev_graph = create_monthly_std_dev_graph(data_sources)
+
     status_lines = [f"Listed on {exchange} Stock Exchange: {status}" for exchange, status in listing_status.items()]
     status_output = html.Div([html.P(line) for line in status_lines])
 
-    return status_output, closing_price_graph, avg_volume_graph, technical_info
+    return status_output, closing_price_graph, avg_volume_graph, technical_info, price_difference_graph, monthly_std_dev_graph
 
 
 if __name__ == "__main__":
